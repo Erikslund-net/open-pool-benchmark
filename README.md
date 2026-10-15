@@ -60,8 +60,8 @@ docker compose run --rm openbench suite
 docker compose run --rm openbench report
 
 # or run them individually, e.g. the 1-core vs 4-core bench comparison the report charts:
-docker compose run --rm openbench bench  --pools all --pool-cpus 1   --label 1-core
-docker compose run --rm openbench bench  --pools all --pool-cpus 1-4 --label 4-core
+docker compose run --rm openbench bench  --pools all --pool-cpus 1   --bench-cpus 2-15 --label 1-core
+docker compose run --rm openbench bench  --pools all --pool-cpus 1-4 --bench-cpus 5-15 --label 4-core
 docker compose run --rm openbench sweep  --pools all --conns "1 16 64 128" --label sweep
 docker compose run --rm openbench report
 ```

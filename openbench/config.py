@@ -105,6 +105,19 @@ class Pinning:
     pool_cpus: str
     bench_cpus: str
 
+    def __post_init__(self) -> None:
+        if not self.enabled:
+            return
+        shared = cpuset_members(self.bitcoind_cpus) & (
+            cpuset_members(self.pool_cpus) | cpuset_members(self.bench_cpus)
+        )
+        if shared:
+            cpus = ", ".join(str(cpu) for cpu in sorted(shared))
+            raise ConfigError(
+                f"bitcoind_cpus {self.bitcoind_cpus!r} overlaps the pool/bench cpus on {cpus}; "
+                "the regtest node needs cores of its own"
+            )
+
 
 @dataclasses.dataclass(frozen=True)
 class Readiness:

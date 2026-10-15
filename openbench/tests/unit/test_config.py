@@ -50,6 +50,19 @@ class PinningTests(base.TempDirTestCase):
         self.assertEqual(registry.pinning.pool_cpus, "4-7")
         self.assertEqual(registry.pinning.bitcoind_cpus, "0")
 
+    def test_bitcoind_sharing_a_pool_core_raises(self) -> None:
+        with self.assertRaises(config.ConfigError) as exc:
+            base.sample_pinning(bitcoind_cpus="0-1", pool_cpus="1-4", bench_cpus="5")
+        self.assertIn("on 1;", str(exc.exception))
+
+    def test_bitcoind_sharing_a_bench_core_raises(self) -> None:
+        with self.assertRaises(config.ConfigError):
+            base.sample_pinning(bitcoind_cpus="0-1", pool_cpus="2", bench_cpus="1-3")
+
+    def test_overlap_is_allowed_when_pinning_is_disabled(self) -> None:
+        pinning = base.sample_pinning(enabled=False, bitcoind_cpus="0-1", pool_cpus="1")
+        self.assertFalse(pinning.enabled)
+
 
 class AdversarialRegistryTests(base.TempDirTestCase):
     def test_missing_file_raises(self) -> None:

@@ -25,12 +25,12 @@ def _audit_line(**fields: int) -> str:
     return "AUDIT " + json.dumps(fields)
 
 
-def _registry() -> config.Registry:
+def _registry(pinning: config.Pinning | None = None) -> config.Registry:
     return config.Registry(
         pools={},
         profiles={},
         regtest=base.sample_regtest(),
-        pinning=base.sample_pinning(),
+        pinning=pinning or base.sample_pinning(),
         root=pathlib.Path("."),
     )
 
@@ -96,6 +96,11 @@ class CoreAllocationTests(unittest.TestCase):
     def test_no_free_cores_raises(self) -> None:
         with self.assertRaises(config.ConfigError):
             runner._registry_for_cores(_registry(), "1-3", host_cores=4)  # 0 + 1,2,3 = all 4
+
+    def test_pool_on_a_bitcoind_core_raises(self) -> None:
+        two_core_node = base.sample_pinning(bitcoind_cpus="0-1", pool_cpus="2", bench_cpus="3")
+        with self.assertRaises(config.ConfigError):
+            runner._registry_for_cores(_registry(two_core_node), "1-4", host_cores=16)
 
     def test_auto_workers_is_one_per_spare_core_capped(self) -> None:
         auto = runner.BenchKnobs(workers=0)

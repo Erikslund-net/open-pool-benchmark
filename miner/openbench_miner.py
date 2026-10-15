@@ -48,6 +48,9 @@ DIFF1_TARGET = 0xFFFF << 208
 
 _PACK_LE_UINT32 = struct.Struct("<I").pack  # bound once; avoids re-parsing per nonce
 
+_DRAIN_LIMIT = 256
+_FOUND_QUEUE_LIMIT = 4096
+
 LOG = logging.getLogger(__name__)
 
 
@@ -435,7 +438,12 @@ def _search_worker(worker_id: int, num_workers: int, shared, found_queue, hash_c
                 hash_int = int.from_bytes(digest, "little")
                 if hash_int <= target:
                     is_block = hash_int <= block_target
-                    found_queue.put((job_id, extranonce2_hex, ntime_hex, "%08x" % nonce, is_block))
+                    try:
+                        found_queue.put_nowait(
+                            (job_id, extranonce2_hex, ntime_hex, "%08x" % nonce, is_block)
+                        )
+                    except queue.Full:
+                        pass  # submitting is the bottleneck; drop the excess, keep memory bounded
             nonce += 1
         local_hashes += nonce - chunk_start
         if local_hashes >= FLUSH_BATCH:
@@ -683,7 +691,7 @@ class _Connection:
         self.shared["job"] = None
         self.shared["extranonce1"] = ""
         self.shared["extranonce2_size"] = 0
-        self.found_queue: mp.Queue = mp.Queue()
+        self.found_queue: mp.Queue = mp.Queue(maxsize=_FOUND_QUEUE_LIMIT)
         self.hash_counter = mp.Value("Q", 0)
         self.stop_event = mp.Event()
         self.workers: list[mp.Process] = []
@@ -732,21 +740,21 @@ class _Connection:
         return True
 
     def drain_and_submit(self) -> None:
-        """Submit any shares this connection's workers have found."""
-        try:
-            while True:
+        """Submit up to _DRAIN_LIMIT of the shares this connection's workers have found."""
+        for _ in range(_DRAIN_LIMIT):
+            try:
                 job_id, extranonce2, ntime, nonce, is_block = self.found_queue.get_nowait()
-                if is_block:
-                    self.blocks_submitted += 1
-                    LOG.warning(
-                        "*** BLOCK FOUND *** conn=%d job=%s nonce=%s -- submitting",
-                        self.conn_id,
-                        job_id,
-                        nonce,
-                    )
-                self.client.submit(job_id, extranonce2, ntime, nonce)
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                return
+            if is_block:
+                self.blocks_submitted += 1
+                LOG.warning(
+                    "*** BLOCK FOUND *** conn=%d job=%s nonce=%s -- submitting",
+                    self.conn_id,
+                    job_id,
+                    nonce,
+                )
+            self.client.submit(job_id, extranonce2, ntime, nonce)
 
     def hashes(self) -> int:
         with self.hash_counter.get_lock():
