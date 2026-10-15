@@ -45,9 +45,11 @@ profiles:
 
 pools:
   pogolo:
-    description: 0xf0xx0/pogolo (Go solo pool)
-    source: image
-    image: 0xf0xx0/pogolo:testing
+    description: 0xf0xx0/pogolo (Go solo pool, built from GitHub)
+    source: build
+    build_context: ../pogolo
+    repo: https://github.com/0xf0xx0/pogolo.git   # no repo_ref: tracks the default branch tip
+    dockerfile: contrib/pkgs/docker/Dockerfile    # upstream's own image recipe
     stratum_port: 5661
     api_port: 5662
     config:
@@ -98,9 +100,8 @@ pools:
   erikslund-cpp:
     description: erikslund-solo-pool C++ pool (C++26)
     source: build
-    build_context: ../erikslund-solo-pool/cpp
-    repo: https://github.com/eandersson/erikslund-solo-pool.git
-    repo_dir: ../erikslund-solo-pool
+    build_context: ../erikslund-solo-pool
+    repo: git@github.com:Erikslund-net/erikslund-solo-pool.git
     repo_ref: main
     dockerfile: Dockerfile
     stratum_port: 3333
