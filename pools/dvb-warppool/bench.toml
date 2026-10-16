@@ -1,0 +1,30 @@
+# dvb-WarpPool bench config: solo payout to the regtest address, vardiff from
+# the active profile. Rate limiting is off: the bench opens many connections
+# from one IP, which the production defaults (per-IP connect/auth limits)
+# would throttle. The "enterprise" profile is the largest connection profile;
+# it caps the pool at 4,096 concurrent connections by design, so conn-limit
+# reports 4,096 for this pool.
+[profile]
+kind = "enterprise"
+
+[node]
+rpc_url = "http://${RPC_HOST}:${RPC_PORT}"
+zmq_hashblock_addr = "tcp://${RPC_HOST}:28332"
+check_core_updates = false
+
+[mining]
+payout_address = "${ADDRESS}"
+pooltag_prefix = "${TAG}"
+
+[server]
+pool_listen = ":3333"
+status_listen = ":18334"
+
+[vardiff]
+enabled = true
+min_diff = ${MIN_DIFFICULTY}
+max_diff = ${MAX_DIFFICULTY}
+initial_diff = ${DIFFICULTY}
+
+[ratelimit]
+enabled = false

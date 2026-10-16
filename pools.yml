@@ -141,3 +141,23 @@ pools:
       status: 200
       body: ok
       timeout_seconds: 60
+
+  dvb-warppool:
+    description: dvb-projekt/dvb-WarpPool (Rust solo pool, release image)
+    source: build
+    build_context: pools/dvb-warppool
+    dockerfile: Dockerfile
+    stratum_port: 3333
+    api_port: 18334
+    env:
+      OPENBENCH_RPC_USER: "${RPC_USER}"
+      OPENBENCH_RPC_PASS: "${RPC_PASS}"
+    config:
+      format: toml
+      template: pools/dvb-warppool/bench.toml
+      mount: /config/config.toml
+    readiness:
+      kind: http
+      url: http://${POOL_HOST}:${API_PORT}/healthz
+      status: 200
+      timeout_seconds: 120
