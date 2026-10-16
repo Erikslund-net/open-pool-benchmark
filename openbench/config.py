@@ -32,6 +32,9 @@ TEMPLATE_VARIABLES = frozenset(
         "API_PORT",
         "POOL_HOST",
         "POOL_CORES",
+        "BACKEND_HOST",
+        "BACKEND_PORT",
+        "LB_CORES",
     }
 )
 
@@ -104,6 +107,7 @@ class Pinning:
     bitcoind_cpus: str
     pool_cpus: str
     bench_cpus: str
+    lb_cpus: str = ""  # the load balancer's cores, used only with --via-lb
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -117,6 +121,28 @@ class Pinning:
                 f"bitcoind_cpus {self.bitcoind_cpus!r} overlaps the pool/bench cpus on {cpus}; "
                 "the regtest node needs cores of its own"
             )
+
+
+def check_lb_pinning(pinning: Pinning) -> None:
+    """With --via-lb and pinning on, the load balancer needs `lb_cpus` of its own."""
+    if not pinning.enabled:
+        return
+    if not pinning.lb_cpus:
+        raise ConfigError(
+            "--via-lb with cpu pinning needs lb_cpus (pinning.lb_cpus in pools.yml or --lb-cpus)"
+        )
+    others = (
+        cpuset_members(pinning.bitcoind_cpus)
+        | cpuset_members(pinning.pool_cpus)
+        | cpuset_members(pinning.bench_cpus)
+    )
+    shared = cpuset_members(pinning.lb_cpus) & others
+    if shared:
+        cpus = ", ".join(str(cpu) for cpu in sorted(shared))
+        raise ConfigError(
+            f"lb_cpus {pinning.lb_cpus!r} overlaps the bitcoind/pool/bench cpus on {cpus}; "
+            "the load balancer needs cores of its own"
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -170,6 +196,8 @@ class Registry:
     regtest: Regtest
     pinning: Pinning
     root: pathlib.Path
+    loadbalancer: PoolSpec | None = None  # optional Stratum load balancer from `loadbalancer:`
+    via_lb: bool = False  # put the load balancer in front of every pool under test (--via-lb)
 
     def pool(self, name: str) -> PoolSpec:
         try:
@@ -234,8 +262,8 @@ def _parse_config(raw: dict[str, Any], where: str) -> ConfigSpec:
     )
 
 
-def _parse_pool(name: str, raw: dict[str, Any]) -> PoolSpec:
-    where = f"pools.{name}"
+def _parse_pool(name: str, raw: dict[str, Any], where: str | None = None) -> PoolSpec:
+    where = where or f"pools.{name}"
     source = _require(raw, "source", where)
     if source not in VALID_SOURCES:
         raise ConfigError(f"{where}: source {source!r} not in {sorted(VALID_SOURCES)}")
@@ -278,6 +306,7 @@ def _parse_pinning(raw: dict[str, Any]) -> Pinning:
         bitcoind_cpus=str(raw.get("bitcoind_cpus", "0")),
         pool_cpus=str(raw.get("pool_cpus", "1")),
         bench_cpus=str(raw.get("bench_cpus", "2")),
+        lb_cpus=str(raw.get("lb_cpus", "")),
     )
 
 
@@ -332,10 +361,15 @@ def load_registry(path: str | pathlib.Path) -> Registry:
 
     regtest = _parse_regtest(_as_mapping(_require(document, "regtest", str(path)), "regtest"))
     pinning = _parse_pinning(_as_mapping(document.get("pinning", {}), "pinning"))
+    loadbalancer = None
+    if document.get("loadbalancer") is not None:
+        raw_lb = _as_mapping(document["loadbalancer"], "loadbalancer")
+        loadbalancer = _parse_pool("loadbalancer", raw_lb, "loadbalancer")
     return Registry(
         pools=pools,
         profiles=profiles,
         regtest=regtest,
         pinning=pinning,
         root=path.parent.resolve(),
+        loadbalancer=loadbalancer,
     )

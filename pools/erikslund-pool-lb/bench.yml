@@ -1,0 +1,57 @@
+# Bench config for erikslund-pool-lb in front of one pool under test (`openbench --via-lb`).
+# Shaped like the upstream conf/pool-lb.compose.yml, but every admission, rate and byte limit is
+# raised far past what the benchmark generates (all load comes from one probe IP, at up to ~1M
+# messages/s), so the run measures the proxy's overhead rather than its protection. No PROXY v2
+# header (pogolo and ckpool don't parse it) and no health_address, so the backend check is a plain
+# TCP connect for every pool alike.
+listeners:
+  - name: sv1
+    address: "0.0.0.0:3333"
+    tls: false
+    certificate_file: ""
+    private_key_file: ""
+active_pool: bench
+failover: false
+pools:
+  - name: bench
+    backends:
+      - name: pool-under-test
+        address: "${BACKEND_HOST}:${BACKEND_PORT}"
+        send_proxy_v2: false
+api_address: "0.0.0.0:7778"
+io_workers: ${LB_CORES}
+health:
+  interval_seconds: 1
+  connect_timeout_milliseconds: 3000
+  rise_checks: 1
+  fall_checks: 2
+limits:
+  max_connections: 100000
+  max_connections_per_ip: 100000
+  connections_per_second_per_ip: 1000000.0
+  connection_burst_per_ip: 100000
+  global_connections_per_second: 1000000.0
+  global_connection_burst: 100000
+  ipv6_prefix_bits: 64
+  max_tracked_client_ips: 4096
+  client_state_retention_seconds: 300
+  messages_per_second_per_connection: 100000000.0
+  message_burst_per_connection: 100000000
+  bytes_per_second_per_connection: 10000000000.0
+  byte_burst_per_connection: 2000000000
+  messages_per_second_per_ip: 1000000000.0
+  message_burst_per_ip: 1000000000
+  bytes_per_second_per_ip: 100000000000.0
+  byte_burst_per_ip: 2000000000
+  max_messages_per_ready_event: 2048
+  max_line_bytes: 16384
+  max_buffer_bytes: 262144
+  tls_handshake_timeout_seconds: 10
+  first_message_timeout_seconds: 15
+  upstream_connect_timeout_milliseconds: 15000
+  idle_timeout_seconds: 3600
+protocol:
+  additional_allowed_methods: []
+  additional_initial_methods: []
+  allow_unknown_mining_methods: true
+  max_json_depth: 32

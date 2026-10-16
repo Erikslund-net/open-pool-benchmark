@@ -63,6 +63,66 @@ class PinningTests(base.TempDirTestCase):
         pinning = base.sample_pinning(enabled=False, bitcoind_cpus="0-1", pool_cpus="1")
         self.assertFalse(pinning.enabled)
 
+    def test_lb_cpus_parse_and_default_empty(self) -> None:
+        registry = config.load_registry(self.write_registry(base.VALID_REGISTRY_YAML))
+        self.assertEqual(registry.pinning.lb_cpus, "")
+        text = base.VALID_REGISTRY_YAML + "\npinning:\n  lb_cpus: '14-15'\n"
+        self.assertEqual(config.load_registry(self.write_registry(text)).pinning.lb_cpus, "14-15")
+
+    def test_lb_pinning_needs_lb_cpus(self) -> None:
+        with self.assertRaises(config.ConfigError):
+            config.check_lb_pinning(base.sample_pinning())
+
+    def test_lb_pinning_rejects_shared_cores(self) -> None:
+        with self.assertRaises(config.ConfigError) as exc:
+            config.check_lb_pinning(base.sample_pinning(bench_cpus="2-15", lb_cpus="14-15"))
+        self.assertIn("on 14, 15;", str(exc.exception))
+
+    def test_lb_pinning_accepts_own_cores_or_no_pinning(self) -> None:
+        config.check_lb_pinning(base.sample_pinning(bench_cpus="2-13", lb_cpus="14-15"))
+        config.check_lb_pinning(base.sample_pinning(enabled=False))
+
+
+class LoadBalancerTests(base.TempDirTestCase):
+    _LB_YAML = """
+loadbalancer:
+  description: test lb
+  source: build
+  build_context: ../erikslund-pool-lb
+  stratum_port: 3333
+  api_port: 7778
+  config:
+    format: yaml
+    template: pools/erikslund-pool-lb/bench.yml
+    mount: /etc/erikslund-pool-lb/pool-lb.yml
+  readiness:
+    kind: http
+    url: http://${POOL_HOST}:${API_PORT}/healthz
+"""
+
+    def test_loadbalancer_is_optional(self) -> None:
+        registry = config.load_registry(self.write_registry(base.VALID_REGISTRY_YAML))
+        self.assertIsNone(registry.loadbalancer)
+        self.assertFalse(registry.via_lb)
+
+    def test_loadbalancer_parses_like_a_pool(self) -> None:
+        registry = config.load_registry(
+            self.write_registry(base.VALID_REGISTRY_YAML + self._LB_YAML)
+        )
+        lb = registry.loadbalancer
+        assert lb is not None
+        self.assertEqual(
+            (lb.name, lb.source, lb.stratum_port, lb.api_port),
+            ("loadbalancer", "build", 3333, 7778),
+        )
+        self.assertNotIn("loadbalancer", registry.pools)  # not a pool under test
+
+    def test_invalid_loadbalancer_names_its_section(self) -> None:
+        text = base.VALID_REGISTRY_YAML + "\nloadbalancer:\n  source: build\n"
+        with self.assertRaises(config.ConfigError) as exc:
+            config.load_registry(self.write_registry(text))
+        self.assertIn("loadbalancer", str(exc.exception))
+
 
 class AdversarialRegistryTests(base.TempDirTestCase):
     def test_missing_file_raises(self) -> None:

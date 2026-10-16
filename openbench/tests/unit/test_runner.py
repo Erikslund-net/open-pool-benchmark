@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import pathlib
 import unittest
 from unittest import mock
 
+from openbench import adapters
 from openbench import config
 from openbench import runner
 from openbench.tests import base
@@ -80,6 +82,70 @@ class BenchBestRunTests(unittest.TestCase):
         self.assertEqual(probe.call_count, 3)
 
 
+def _rate_run(p50: float, p99: float, lag_p99: float = 0.01, lost: int = 0) -> dict:
+    latency = {"p50": p50, "p90": p50 * 2, "p99": p99, "p999": p99 * 2, "max": p99 * 3}
+    return {
+        "achieved_rate": 100.0,
+        "acked": 1000,
+        "lost": lost,
+        "latency_ms": latency,
+        "send_lag_ms": {"p99": lag_p99},
+        "cpu_pct": 10.0,
+    }
+
+
+class RateTests(unittest.TestCase):
+    def test_step_is_at_least_duration_and_long_enough_for_min_samples(self) -> None:
+        knobs = runner.RateKnobs(duration=10.0, min_samples=60)
+        self.assertEqual(runner.rate_step_seconds(1000, knobs), 10.0)
+        self.assertEqual(runner.rate_step_seconds(1, knobs), 60.0)  # 60 requests at 1/s
+
+    def test_row_takes_medians_across_repeats_and_reports_the_p99_range(self) -> None:
+        runs = [_rate_run(0.2, 0.9), _rate_run(0.3, 1.5), _rate_run(0.25, 1.1)]
+        row = runner.rate_row("pogolo", 100, runs)
+        self.assertEqual(row[:4], ["pogolo", "100", "100", 3000])
+        self.assertEqual(row[4], "0.250")  # median p50
+        self.assertEqual(row[6], "1.100")  # median p99
+        self.assertEqual(row[9], "0.900-1.500")  # p99 spread across the repeats
+        self.assertEqual(row[-1], "ok")
+
+    def test_row_flags_client_lag_and_lost_acks(self) -> None:
+        row = runner.rate_row("ckpool", 10000, [_rate_run(1, 2, lag_p99=3.0, lost=5)])
+        self.assertEqual(row[10], 5)
+        self.assertEqual(row[-1], "client behind schedule; acks lost")
+
+    def test_a_failing_rate_keeps_the_other_rates_and_says_why(self) -> None:
+        @contextlib.contextmanager
+        def fake_session(*_args: object, **_kwargs: object):
+            run = mock.Mock()
+            run.address = "addr"
+            yield run
+
+        def probe(_pool: object, _address: str, value: float, _knobs: object) -> dict:
+            if value == 100:
+                raise adapters.AdapterError("rate probe at 100 req/s: ConnectionError: closed")
+            return _rate_run(0.2, 0.9)
+
+        spec = mock.Mock()
+        spec.name = "ckpool"
+        with (
+            mock.patch("openbench.runner.session", fake_session),
+            mock.patch("openbench.runner._pool_specs", return_value=[spec]),
+            mock.patch("openbench.adapters.PoolUnderTest", lambda *a, **k: _FakePool()),
+            mock.patch("openbench.runner._run_rate_probe", side_effect=probe),
+            mock.patch("openbench.runner._persist") as persist,
+        ):
+            code = runner.rate(
+                mock.Mock(), ["ckpool"], "validation", [1, 100, 1000], runner.RateKnobs(repeat=2)
+            )
+        rows = persist.call_args.args[7]
+        self.assertEqual(code, 1)
+        self.assertEqual([row[1] for row in rows], ["1", "100", "1000"])
+        self.assertEqual([rows[0][-1], rows[2][-1]], ["ok", "ok"])
+        self.assertEqual(rows[1][-1], "FAILED: rate probe at 100 req/s: ConnectionError: closed")
+        self.assertEqual(len(rows[1]), len(rows[0]))  # same columns, so the table lines up
+
+
 class CoreAllocationTests(unittest.TestCase):
     def test_format_cpuset_collapses_runs(self) -> None:
         self.assertEqual(runner._format_cpuset([5, 6, 7, 8]), "5-8")
@@ -101,6 +167,22 @@ class CoreAllocationTests(unittest.TestCase):
         two_core_node = base.sample_pinning(bitcoind_cpus="0-1", pool_cpus="2", bench_cpus="3")
         with self.assertRaises(config.ConfigError):
             runner._registry_for_cores(_registry(two_core_node), "1-4", host_cores=16)
+
+    def test_via_lb_reserves_the_lb_cores(self) -> None:
+        registry = dataclasses.replace(_registry(base.sample_pinning(lb_cpus="14-15")), via_lb=True)
+        pinned = runner._registry_for_cores(registry, "1-4", host_cores=16).pinning
+        self.assertEqual(pinned.bench_cpus, "5-13")  # 14-15 stay with the load balancer
+        self.assertEqual(pinned.lb_cpus, "14-15")
+
+    def test_without_via_lb_the_lb_cores_go_to_the_load_generator(self) -> None:
+        registry = _registry(base.sample_pinning(lb_cpus="14-15"))
+        pinned = runner._registry_for_cores(registry, "1-4", host_cores=16).pinning
+        self.assertEqual(pinned.bench_cpus, "5-15")
+
+    def test_via_lb_pool_on_an_lb_core_raises(self) -> None:
+        registry = dataclasses.replace(_registry(base.sample_pinning(lb_cpus="14-15")), via_lb=True)
+        with self.assertRaises(config.ConfigError):
+            runner._registry_for_cores(registry, "12-15", host_cores=16)
 
     def test_auto_workers_is_one_per_spare_core_capped(self) -> None:
         auto = runner.BenchKnobs(workers=0)

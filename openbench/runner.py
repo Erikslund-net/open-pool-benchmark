@@ -48,6 +48,9 @@ _SUITE_LATENCY_ROUNDS = 20
 _SUITE_MAX_WORKERS = 16
 _VARDIFF_AUDIT_WORKERS = 4
 _VARDIFF_AUDIT_DURATION = 90.0
+_RATE_DRAIN_SECONDS = 5.0  # how long the rate probe waits for the last acks after sending stops
+_RATE_MAX_SEND_LAG_MS = 1.0  # send-lag p99 above this means the client couldn't keep schedule
+_RATE_NOTE_CHARS = 160
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,7 +98,7 @@ def session(
         yield run
     finally:
         if not keep:
-            docker.remove(adapters.POOL_CONTAINER)
+            docker.remove(adapters.POOL_CONTAINER, adapters.LB_CONTAINER)
             backend.down()
             shutil.rmtree(scratch, ignore_errors=True)
 
@@ -344,6 +347,189 @@ def sweep(
                 failed = True
     _emit(headers, rows, csv_path)
     _persist(out, label, "sweep", registry, profile_name, None, headers, rows, records)
+    return 1 if failed else 0
+
+
+@dataclasses.dataclass(frozen=True)
+class RateKnobs:
+    """Knobs for the open-loop latency test (probes/rate_latency.py), shared by every rate."""
+
+    connections: int = 16
+    workers: int = 0  # sender processes per step; 0 = one per ~2k requests/s
+    warmup: float = 2.0
+    duration: float = 10.0  # minimum measured seconds per rate...
+    min_samples: int = 60  # ...stretched so even a slow rate gets this many requests
+    repeat: int = 3
+
+
+def rate_step_seconds(rate: float, knobs: RateKnobs) -> float:
+    """Measured seconds at one rate: at least `duration`, and long enough for `min_samples`."""
+    return max(knobs.duration, knobs.min_samples / rate)
+
+
+def _run_rate_probe(
+    pool: adapters.PoolUnderTest, address: str, rate: float, knobs: RateKnobs
+) -> dict[str, Any]:
+    """One open-loop step at `rate` requests/s while sampling the pool's CPU/RSS."""
+    seconds = rate_step_seconds(rate, knobs)
+    args = _stratum_args(pool, address) + [
+        "--rate",
+        str(rate),
+        "--connections",
+        str(knobs.connections),
+        "--workers",
+        str(knobs.workers),
+        "--warmup",
+        str(knobs.warmup),
+        "--duration",
+        str(seconds),
+        "--drain",
+        str(_RATE_DRAIN_SECONDS),
+    ]
+    timeout = knobs.warmup + seconds + _RATE_DRAIN_SECONDS + _PROBE_OVERHEAD_SECONDS
+    with pool.sampler() as sampler:
+        output = pool.run_probe("rate_latency.py", args, timeout=timeout)
+    lines = output.strip().splitlines()
+    if not lines:
+        raise adapters.AdapterError("rate probe produced no output")
+    try:
+        result: dict[str, Any] = msgspec.json.decode(lines[-1])
+    except msgspec.DecodeError as exc:
+        raise adapters.AdapterError(f"rate probe output was not JSON: {lines[-1][:200]!r}") from exc
+    if result.get("errors"):
+        raise adapters.AdapterError(f"rate probe at {rate:g} req/s: {'; '.join(result['errors'])}")
+    if "latency_ms" not in result or "send_lag_ms" not in result:
+        raise adapters.AdapterError(f"rate probe result missing expected keys: {result}")
+    result["cpu_pct"], result["rss_mib"] = report.parse_docker_stats(sampler.lines)
+    return result
+
+
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def rate_row(pool_name: str, rate: float, runs: Sequence[dict[str, Any]]) -> list[object]:
+    """One table row for a rate: each statistic is the median over the repeats, next to the p99
+    range across them (how repeatable the step was) and a note when the run can't be trusted."""
+
+    def latency(key: str) -> str:
+        return f"{_median([run['latency_ms'][key] for run in runs]):.3f}"
+
+    p99s = [run["latency_ms"]["p99"] for run in runs]
+    lag_p99 = max(run["send_lag_ms"]["p99"] for run in runs)
+    lost = sum(int(run["lost"]) for run in runs)
+    notes = []
+    if lag_p99 > _RATE_MAX_SEND_LAG_MS:
+        notes.append("client behind schedule")
+    if lost:
+        notes.append("acks lost")
+    return [
+        pool_name,
+        f"{rate:g}",
+        f"{_median([run['achieved_rate'] for run in runs]):.0f}",
+        sum(int(run["acked"]) for run in runs),
+        latency("p50"),
+        latency("p90"),
+        latency("p99"),
+        latency("p999"),
+        latency("max"),
+        f"{min(p99s):.3f}-{max(p99s):.3f}",
+        lost,
+        f"{lag_p99:.3f}",
+        f"{_median([run['cpu_pct'] for run in runs]):.0f}",
+        "; ".join(notes) or "ok",
+    ]
+
+
+def rate(
+    registry: config.Registry,
+    pool_names: Sequence[str],
+    profile_name: str,
+    rates: Sequence[float],
+    knobs: RateKnobs,
+    *,
+    out: str | None = None,
+    label: str | None = None,
+    keep: bool = False,
+) -> int:
+    """Open-loop latency: submit->ack latency at each fixed request rate, repeated per rate.
+
+    Requests go out on a fixed schedule whatever the replies, and latency is timed from each
+    request's scheduled send, so a slow pool can't hide its delay by slowing the sender down.
+    """
+    profile = registry.profile(profile_name)
+    headers = [
+        "pool",
+        "rate/s",
+        "sent/s",
+        "n",
+        "p50_ms",
+        "p90_ms",
+        "p99_ms",
+        "p99.9_ms",
+        "max_ms",
+        "p99_range_ms",
+        "lost",
+        "lag_p99_ms",
+        "cpu_pct",
+        "note",
+    ]
+    rows: list[list[object]] = []
+    records: list[dict[str, Any]] = []
+    failed = False
+    step_total = sum(knobs.warmup + rate_step_seconds(r, knobs) for r in rates) * knobs.repeat
+    LOG.info(
+        "rate: %s req/s, ~%.0fs of load per pool", " ".join(f"{r:g}" for r in rates), step_total
+    )
+    with session(registry, keep=keep) as run:
+        for spec in _pool_specs(registry, pool_names):
+            try:
+                with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
+                    for value in rates:
+                        runs = []
+                        try:
+                            for attempt in range(knobs.repeat):
+                                LOG.info(
+                                    "rate %s: %g req/s (run %d/%d)",
+                                    spec.name,
+                                    value,
+                                    attempt + 1,
+                                    knobs.repeat,
+                                )
+                                runs.append(_run_rate_probe(pool, run.address, value, knobs))
+                        except (
+                            _POOL_ERRORS
+                        ) as exc:  # keep the other rates; show why this one failed
+                            LOG.error("pool %s at %g req/s failed: %s", spec.name, value, exc)
+                            note = (
+                                f"FAILED: {str(exc)[:_RATE_NOTE_CHARS]}"  # full text: records/log
+                            )
+                            rows.append(
+                                [spec.name, f"{value:g}", *["-"] * (len(headers) - 3), note]
+                            )
+                            records.append({"pool": spec.name, "rate": value, "error": str(exc)})
+                            failed = True
+                            continue
+                        rows.append(rate_row(spec.name, value, runs))
+                        records.append({"pool": spec.name, "rate": value, "runs": runs})
+            except _POOL_ERRORS as exc:
+                LOG.error("pool %s failed: %s", spec.name, exc)
+                rows.append([spec.name, "FAILED", *["-"] * (len(headers) - 2)])
+                failed = True
+    _emit(headers, rows, None)
+    _persist(
+        out,
+        label,
+        "rate",
+        registry,
+        profile_name,
+        dataclasses.asdict(knobs),
+        headers,
+        rows,
+        records,
+    )
     return 1 if failed else 0
 
 
@@ -713,9 +899,11 @@ def _registry_for_cores(
     registry: config.Registry, pool_cpus: str, host_cores: int
 ) -> config.Registry:
     """A copy of registry pinned with the pool on `pool_cpus` and the load generator on the cores
-    left over after bitcoind and the pool (so the two never share a core)."""
-    bitcoind = config.cpuset_members(registry.pinning.bitcoind_cpus)
-    free = sorted(set(range(host_cores)) - bitcoind - config.cpuset_members(pool_cpus))
+    left over after bitcoind, the pool and (with --via-lb) the load balancer: none share a core."""
+    reserved = config.cpuset_members(registry.pinning.bitcoind_cpus)
+    if registry.via_lb:
+        reserved |= config.cpuset_members(registry.pinning.lb_cpus)
+    free = sorted(set(range(host_cores)) - reserved - config.cpuset_members(pool_cpus))
     if not free:
         raise config.ConfigError(
             f"no cores left for the load generator with pool_cpus={pool_cpus!r} on a "
@@ -724,6 +912,8 @@ def _registry_for_cores(
     pinning = dataclasses.replace(
         registry.pinning, enabled=True, pool_cpus=pool_cpus, bench_cpus=_format_cpuset(free)
     )
+    if registry.via_lb:
+        config.check_lb_pinning(pinning)
     return dataclasses.replace(registry, pinning=pinning)
 
 

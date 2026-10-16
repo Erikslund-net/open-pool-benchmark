@@ -80,10 +80,13 @@ class Client:
         self._authorized = asyncio.Event()
         self._has_job = asyncio.Event()
         asyncio.create_task(self._read_loop())
+        # authorize only after the subscribe reply: pipelined, ckpool can take the authorize first
+        # and reject it (the same order real miners use)
         self._send({"id": 1, "method": "mining.subscribe", "params": ["bench/1.0"]})
-        self._send({"id": 2, "method": "mining.authorize", "params": [self.address, "x"]})
         await self._w.drain()
         await asyncio.wait_for(self._subscribed.wait(), 30)
+        self._send({"id": 2, "method": "mining.authorize", "params": [self.address, "x"]})
+        await self._w.drain()
         await asyncio.wait_for(self._authorized.wait(), 30)
         if not self.auth_ok:
             raise RuntimeError(f"pool rejected authorize for {self.address!r}; supply an address valid on the pool's network")

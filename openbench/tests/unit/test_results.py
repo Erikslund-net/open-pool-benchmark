@@ -89,6 +89,21 @@ class ReportTests(base.TempDirTestCase):
         html = results.render_report([_bench_payload()])
         self.assertIn("makeSortable", html)
 
+    def test_rate_runs_get_their_own_chart(self) -> None:
+        payload = results.make_payload(
+            "rate",
+            label="1-core",
+            profile="validation",
+            pinning=None,
+            knobs=None,
+            columns=["pool", "rate/s"],
+            rows=[["pogolo", "100"]],
+            records=[{"pool": "pogolo", "rate": 100.0, "runs": [{"latency_ms": {"p99": 1.5}}]}],
+        )
+        html = results.render_report([payload])
+        self.assertIn('rateSection(runsOfKind("rate"))', html)  # not dropped like unknown kinds
+        self.assertIn('"rate":100.0', html)
+
     def test_write_report_creates_files(self) -> None:
         out = self.make_tempdir()
         results.write_run(out, _bench_payload())

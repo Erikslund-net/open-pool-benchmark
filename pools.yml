@@ -30,6 +30,7 @@ pinning:
   bitcoind_cpus: "0"
   pool_cpus: "1"
   bench_cpus: "2"
+  lb_cpus: "14-15"   # used only with --via-lb (the suite then gives the load generator the rest)
 
 profiles:
   validation:
@@ -42,6 +43,30 @@ profiles:
   mine:
     difficulty: 1
     coinbase_tag: /openbench/
+
+# Optional Stratum load balancer that `--via-lb` starts in front of each pool under test, pinned to
+# `lb_cpus`; the probes and miner then connect to it instead of the pool. Same shape as a pool
+# adapter; its template also gets BACKEND_HOST/BACKEND_PORT (the pool's Stratum endpoint) and
+# LB_CORES (its pinned core count, 0 = auto when unpinned).
+loadbalancer:
+  description: erikslund-pool-lb (C++26 Stratum-aware load balancer)
+  source: build
+  build_context: ../erikslund-pool-lb
+  repo: https://github.com/eandersson/erikslund-pool-lb.git
+  repo_ref: main
+  dockerfile: Dockerfile
+  stratum_port: 3333
+  api_port: 7778
+  config:
+    format: yaml
+    template: pools/erikslund-pool-lb/bench.yml
+    mount: /etc/erikslund-pool-lb/pool-lb.yml
+  readiness:
+    kind: http
+    url: http://${POOL_HOST}:${API_PORT}/healthz   # 200 "ok" once the pool behind it is healthy
+    status: 200
+    body: ok
+    timeout_seconds: 60
 
 pools:
   pogolo:

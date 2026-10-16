@@ -37,6 +37,7 @@ validation throughput, not luck.
 | `latency` | new-block -> miner-gets-new-work latency, timed from a client's view |
 | `validate` | **validation suite** - the cross-connection work audit (see below) |
 | `suite` | run **all** of the above measurements back to back into `results/`, in one command |
+| `rate` | **open-loop latency**: submit->ack latency at fixed request rates (default 1, 100, 1k, 10k/s), repeated; not part of `suite` |
 | `up` / `down` | manage the shared regtest bitcoind by hand |
 | `list` | show configured pools + profiles |
 
@@ -47,6 +48,13 @@ validation throughput, not luck.
 - **cpu% / rssMiB** - the pool container's mean CPU and peak RSS during the run.
 - **Bottleneck check** - if a pool's `cpu%` is well under `100 x cores` while `val/s` plateaus, the
   *load generator* is the limit, not the pool - give it more cores (`--bench-cpus`) and workers.
+- **bench vs rate latency** - `bench`/`sweep` are closed loop: every connection keeps its pipeline
+  full, so the pool is saturated and its percentiles mostly measure queueing (the average is pinned
+  at in-flight / throughput). `rate` is open loop: shares go out evenly spaced at a fixed rate
+  whatever the replies, and each is timed from its *scheduled* send, so a slow pool can't hide its
+  delay. Each rate runs `--repeat` times; the table shows the median of each percentile, the p99
+  range across repeats (how repeatable it was), and flags runs where the client itself fell
+  behind schedule (`lag_p99_ms` > 1) or acks never came back.
 
 ### Output & report
 

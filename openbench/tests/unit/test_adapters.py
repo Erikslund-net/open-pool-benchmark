@@ -9,6 +9,8 @@ import tomllib
 import unittest
 from unittest import mock
 
+import yaml
+
 from openbench import adapters
 from openbench import config
 from openbench.tests import base
@@ -112,6 +114,30 @@ class BuildSubstitutionsTests(unittest.TestCase):
             base.sample_pinning(enabled=False),
         )
         self.assertEqual(mapping["POOL_CORES"], "max")
+
+    def test_lb_mapping_points_its_backend_at_the_pool(self) -> None:
+        lb = base.sample_pool(name="loadbalancer", stratum_port=3333, api_port=7778)
+        mapping = adapters.build_lb_substitutions(
+            lb,
+            base.sample_pool(stratum_port=5661),
+            base.sample_profile(),
+            base.sample_regtest(),
+            base.sample_pinning(lb_cpus="14-15"),
+        )
+        self.assertEqual(mapping["POOL_HOST"], adapters.LB_CONTAINER)  # its own readiness target
+        self.assertEqual(mapping["API_PORT"], "7778")
+        self.assertEqual(mapping["BACKEND_HOST"], adapters.POOL_CONTAINER)
+        self.assertEqual(mapping["BACKEND_PORT"], "5661")
+        self.assertEqual(mapping["LB_CORES"], "2")
+
+    def test_lb_cores_is_auto_when_unpinned(self) -> None:
+        mapping = adapters.build_substitutions(
+            base.sample_pool(),
+            base.sample_profile(),
+            base.sample_regtest(),
+            base.sample_pinning(enabled=False, lb_cpus="14-15"),
+        )
+        self.assertEqual(mapping["LB_CORES"], "0")
 
 
 class RenderConfigTests(unittest.TestCase):
@@ -220,6 +246,29 @@ class RealTemplateRenderTests(unittest.TestCase):
         rendered = self._render("erikslund-cpp")
         self.assertIn("variable_difficulty: true", rendered)
         self.assertNotIn("${", rendered)
+
+    def test_loadbalancer_real_template_targets_each_pool(self) -> None:
+        lb = self.registry.loadbalancer
+        assert lb is not None and lb.config.template is not None
+        text = (self.registry.root / lb.config.template).read_text(encoding="utf-8")
+        for pool in self.registry.pools.values():
+            mapping = adapters.build_lb_substitutions(
+                lb,
+                pool,
+                self.registry.profile("validation"),
+                self.registry.regtest,
+                self.registry.pinning,
+            )
+            parsed = yaml.safe_load(adapters.render_config(text, lb.config.format, mapping))
+            backend = parsed["pools"][0]["backends"][0]
+            self.assertEqual(backend["address"], f"{adapters.POOL_CONTAINER}:{pool.stratum_port}")
+            self.assertIs(backend["send_proxy_v2"], False)  # pogolo/ckpool can't parse PROXY v2
+            self.assertEqual(parsed["io_workers"], 2)  # one per lb_cpus core
+            assert lb.readiness.url is not None
+            self.assertEqual(
+                adapters.substitute(lb.readiness.url, mapping),
+                f"http://{adapters.LB_CONTAINER}:7778/healthz",
+            )
 
     def test_readiness_urls_render(self) -> None:
         for spec in self.registry.pools.values():

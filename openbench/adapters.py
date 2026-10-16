@@ -28,9 +28,19 @@ if TYPE_CHECKING:
 LOG = logging.getLogger(__name__)
 
 POOL_CONTAINER = "openbench-pool"
+LB_CONTAINER = "openbench-lb"
 _LOCALHOST = "127.0.0.1"
 _READY_LOG_TAIL = 20
 _NOFILE_ARGS = ["--ulimit", "nofile=65535"]
+# A proxy holds two descriptors per connection, and opens one upstream connection per client from
+# a single IP to one pool address, so it needs the same wide ephemeral port range as the probes
+# (the default 32768-60999 caps it at ~28k connections).
+_LB_RUN_ARGS = [
+    "--ulimit",
+    "nofile=262144",
+    "--sysctl",
+    "net.ipv4.ip_local_port_range=1024 65535",
+]
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -51,6 +61,9 @@ def build_substitutions(
 ) -> dict[str, str]:
     """The `${VAR}` -> value mapping for a pool's config template and readiness target."""
     pool_cores = str(config.cpuset_count(pinning.pool_cpus)) if pinning.enabled else "max"
+    lb_cores = (
+        str(config.cpuset_count(pinning.lb_cpus)) if pinning.enabled and pinning.lb_cpus else "0"
+    )
     return {
         "RPC_HOST": regtest.bitcoind_container,
         "RPC_PORT": str(regtest.rpc_port),
@@ -64,7 +77,25 @@ def build_substitutions(
         "API_PORT": str(spec.api_port) if spec.api_port is not None else "",
         "POOL_HOST": POOL_CONTAINER,
         "POOL_CORES": pool_cores,
+        "BACKEND_HOST": POOL_CONTAINER,
+        "BACKEND_PORT": str(spec.stratum_port),
+        "LB_CORES": lb_cores,
     }
+
+
+def build_lb_substitutions(
+    lb: config.PoolSpec,
+    pool: config.PoolSpec,
+    profile: config.Profile,
+    regtest: config.Regtest,
+    pinning: config.Pinning,
+) -> dict[str, str]:
+    """The mapping for the load balancer's template and readiness target: POOL_HOST/API_PORT are
+    its own, BACKEND_HOST/BACKEND_PORT the Stratum endpoint of the pool behind it."""
+    mapping = build_substitutions(lb, profile, regtest, pinning)
+    mapping["POOL_HOST"] = LB_CONTAINER
+    mapping["BACKEND_PORT"] = str(pool.stratum_port)
+    return mapping
 
 
 def substitute(text: str, mapping: dict[str, str]) -> str:
@@ -138,7 +169,9 @@ class PoolUnderTest:
 
     Enter: obtain the image (pull or build), render + mount the config, run it on the regtest net
     pinned to the configured pool cores with its Stratum/API ports published to localhost, and block
-    until ready. Exit (and any failure mid-enter): remove the container.
+    until ready. With `registry.via_lb`, then start the registry's load balancer in front of it on
+    its own cores; the Stratum endpoint the probes use becomes the load balancer's, while CPU/RSS
+    sampling stays on the pool. Exit (and any failure mid-enter): remove the containers.
     """
 
     def __init__(
@@ -157,14 +190,20 @@ class PoolUnderTest:
         self._keep = keep
         self._mapping = build_substitutions(spec, profile, run.registry.regtest, self._pinning)
         self._image = ""
+        self._lb = run.registry.loadbalancer if run.registry.via_lb else None
+        self._lb_mapping = (
+            build_lb_substitutions(self._lb, spec, profile, run.registry.regtest, self._pinning)
+            if self._lb is not None
+            else {}
+        )
 
     @property
     def stratum_host(self) -> str:
-        return POOL_CONTAINER
+        return LB_CONTAINER if self._lb is not None else POOL_CONTAINER
 
     @property
     def stratum_port(self) -> int:
-        return self._spec.stratum_port
+        return self._lb.stratum_port if self._lb is not None else self._spec.stratum_port
 
     @property
     def address(self) -> str:
@@ -207,19 +246,21 @@ class PoolUnderTest:
 
     def __enter__(self) -> PoolUnderTest:
         try:
-            docker.remove(POOL_CONTAINER)
-            self._image = self._ensure_image()
-            volumes = self._render_config_volume()
+            docker.remove(POOL_CONTAINER, LB_CONTAINER)
+            self._image = self._ensure_image(self._spec)
+            volumes = self._render_config_volume(self._spec, self._mapping)
             self._start(volumes)
-            self._await_ready()
+            self._await_ready(self._spec, POOL_CONTAINER, self._mapping)
+            if self._lb is not None:
+                self._start_lb(self._lb)
             return self
         except BaseException:
-            docker.remove(POOL_CONTAINER)
+            docker.remove(POOL_CONTAINER, LB_CONTAINER)
             raise
 
     def __exit__(self, *exc: object) -> None:
         if not self._keep:
-            docker.remove(POOL_CONTAINER)
+            docker.remove(POOL_CONTAINER, LB_CONTAINER)
 
     def _bench_cpus(self) -> str | None:
         return self._pinning.bench_cpus if self._pinning.enabled else None
@@ -231,8 +272,7 @@ class PoolUnderTest:
         candidate = pathlib.Path(path)
         return candidate if candidate.is_absolute() else (self._run.registry.root / candidate)
 
-    def _ensure_image(self) -> str:
-        spec = self._spec
+    def _ensure_image(self, spec: config.PoolSpec) -> str:
         if spec.source == "image":
             assert spec.image is not None
             if not docker.image_exists(spec.image):
@@ -241,7 +281,7 @@ class PoolUnderTest:
         assert spec.build_context is not None
         context = self._resolve(spec.build_context)
         if not context.is_dir() and spec.repo:
-            self._clone_source()
+            self._clone_source(spec)
         if not context.is_dir():
             hint = (
                 "set its `repo:` in pools.yml to auto-clone, or"
@@ -260,10 +300,9 @@ class PoolUnderTest:
         docker.build(tag, context, dockerfile)
         return tag
 
-    def _clone_source(self) -> None:
-        """Clone the pool's `repo` so a missing build context appears. When the context is a subdir
+    def _clone_source(self, spec: config.PoolSpec) -> None:
+        """Clone the spec's `repo` so a missing build context appears. When the context is a subdir
         of the repo, `repo_dir` says where the repo root goes (default: the build context)."""
-        spec = self._spec
         assert spec.repo is not None and spec.build_context is not None
         dest = self._resolve(spec.repo_dir or spec.build_context)
         if dest.exists():
@@ -271,23 +310,19 @@ class PoolUnderTest:
         dest.parent.mkdir(parents=True, exist_ok=True)
         _git_clone(spec.repo, dest, spec.repo_ref, spec.name)
 
-    def _render_config_volume(self) -> list[str]:
-        cfg = self._spec.config
+    def _render_config_volume(self, spec: config.PoolSpec, mapping: dict[str, str]) -> list[str]:
+        cfg = spec.config
         if cfg.format == "none" or not cfg.template:
             return []
         if not cfg.mount:
-            raise AdapterError(
-                f"pool {self._spec.name!r}: config has a template but no 'mount' path"
-            )
+            raise AdapterError(f"pool {spec.name!r}: config has a template but no 'mount' path")
         template_path = self._resolve(cfg.template)
         if not template_path.is_file():
             raise AdapterError(f"config template not found: {template_path}")
-        rendered = render_config(
-            template_path.read_text(encoding="utf-8"), cfg.format, self._mapping
-        )
-        rendered_path = self._run.scratch / f"{self._spec.name}-{pathlib.Path(cfg.mount).name}"
+        rendered = render_config(template_path.read_text(encoding="utf-8"), cfg.format, mapping)
+        rendered_path = self._run.scratch / f"{spec.name}-{pathlib.Path(cfg.mount).name}"
         rendered_path.write_text(rendered, encoding="utf-8")
-        LOG.info("rendered %s config -> %s", self._spec.name, cfg.mount)
+        LOG.info("rendered %s config -> %s", spec.name, cfg.mount)
         return [docker.mount(rendered_path, cfg.mount, read_only=True)]
 
     def _start(self, volumes: list[str]) -> None:
@@ -312,38 +347,69 @@ class PoolUnderTest:
         if mapping:
             LOG.info("pool %s host ports (random):\n%s", spec.name, mapping)
 
-    def _await_ready(self) -> None:
-        readiness = self._spec.readiness
+    def _start_lb(self, lb: config.PoolSpec) -> None:
+        """Start the load balancer in front of the (ready) pool, pinned to its own cores."""
+        image = self._ensure_image(lb)
+        volumes = self._render_config_volume(lb, self._lb_mapping)
+        ports = [f"{_LOCALHOST}::{lb.stratum_port}"]
+        if lb.api_port is not None:
+            ports.append(f"{_LOCALHOST}::{lb.api_port}")
+        env = {key: substitute(value, self._lb_mapping) for key, value in lb.env.items()}
+        cpuset = self._pinning.lb_cpus if self._pinning.enabled else None
+        LOG.info(
+            "starting load balancer %s (%s) pinned to cpus %s in front of %s",
+            lb.name,
+            image,
+            cpuset or "all",
+            self._spec.name,
+        )
+        docker.run_detached(
+            LB_CONTAINER,
+            image,
+            network=self._backend.network,
+            cpuset=cpuset,
+            env=env,
+            ports=ports,
+            volumes=volumes,
+            extra_args=_LB_RUN_ARGS,
+        )
+        self._await_ready(lb, LB_CONTAINER, self._lb_mapping)
+
+    def _await_ready(self, spec: config.PoolSpec, container: str, mapping: dict[str, str]) -> None:
+        readiness = spec.readiness
         if readiness.kind == "log":
             assert readiness.pattern is not None
             ready = docker.wait_log(
-                POOL_CONTAINER, readiness.pattern, timeout_seconds=readiness.timeout_seconds
+                container, readiness.pattern, timeout_seconds=readiness.timeout_seconds
             )
         else:
-            ready = self._await_ready_in_network(readiness)
+            ready = self._await_ready_in_network(spec, container, mapping)
         if not ready:
-            tail = "\n".join(docker.logs(POOL_CONTAINER).splitlines()[-_READY_LOG_TAIL:])
+            tail = "\n".join(docker.logs(container).splitlines()[-_READY_LOG_TAIL:])
             raise AdapterError(
-                f"pool {self._spec.name!r} did not become ready via {readiness.kind}; "
-                f"recent logs:\n{tail}"
+                f"{spec.name!r} did not become ready via {readiness.kind}; recent logs:\n{tail}"
             )
-        LOG.info("pool %s is ready", self._spec.name)
+        role = "pool" if container == POOL_CONTAINER else "load balancer"
+        LOG.info("%s %s is ready", role, spec.name)
 
-    def _await_ready_in_network(self, readiness: config.Readiness) -> bool:
+    def _await_ready_in_network(
+        self, spec: config.PoolSpec, container: str, mapping: dict[str, str]
+    ) -> bool:
         """Poll http/tcp readiness from a sibling container (works under docker-out-of-docker)."""
+        readiness = spec.readiness
         args = ["--timeout", str(readiness.timeout_seconds)]
         if readiness.kind == "http":
             assert readiness.url is not None
             args += [
                 "--http",
-                substitute(readiness.url, self._mapping),
+                substitute(readiness.url, mapping),
                 "--status",
                 str(readiness.status),
             ]
             if readiness.body is not None:
                 args += ["--body", readiness.body]
         else:
-            args += ["--tcp", f"{POOL_CONTAINER}:{self._spec.stratum_port}"]
+            args += ["--tcp", f"{container}:{spec.stratum_port}"]
         code, _ = docker.run_oneshot_status(
             docker.PROBE_IMAGE,
             ["python", "/probes/wait_ready.py", *args],

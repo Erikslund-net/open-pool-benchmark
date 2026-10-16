@@ -39,6 +39,13 @@ def _int_list(text: str) -> list[int]:
     return [int(token) for token in text.replace(",", " ").split()]
 
 
+def _rate_list(text: str) -> list[float]:
+    rates = [float(token) for token in text.replace(",", " ").split()]
+    if not rates or any(value <= 0 for value in rates):
+        raise config.ConfigError(f"--rates needs positive requests/s values, got {text!r}")
+    return rates
+
+
 def _resolve_pools(registry: config.Registry, requested: str) -> list[str]:
     if requested == "all":
         names = registry.enabled_pools()
@@ -51,6 +58,15 @@ def _resolve_pools(registry: config.Registry, requested: str) -> list[str]:
     for name in names:
         registry.pool(name)
     return names
+
+
+def _add_lb_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--via-lb",
+        action="store_true",
+        help="put the registry's `loadbalancer:` in front of each pool (probes connect to it)",
+    )
+    parser.add_argument("--lb-cpus", help="cpuset for the load balancer (with --via-lb)")
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -67,6 +83,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bench-cpus", help="cpuset for the load generators / probes / miner")
     parser.add_argument("--bitcoind-cpus", help="cpuset for the regtest node")
     parser.add_argument("--no-pin", action="store_true", help="disable CPU pinning entirely")
+    _add_lb_options(parser)
     parser.add_argument(
         "--out",
         default=results.DEFAULT_OUT_DIR,
@@ -141,6 +158,29 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common(latency)
     latency.add_argument("--rounds", type=int, default=20)
 
+    rate_cmd = sub.add_parser(
+        "rate", help="open-loop submit->ack latency at fixed request rates (repeatable)"
+    )
+    _add_common(rate_cmd)
+    rate_cmd.add_argument(
+        "--rates",
+        default="1 100 1000 10000",
+        help="requests/s to test, in order (default '1 100 1000 10000')",
+    )
+    rate_cmd.add_argument("--connections", type=int, default=16, help="spread over N connections")
+    rate_cmd.add_argument(
+        "--workers", type=int, default=0, help="sender processes (0 = one per ~2k requests/s)"
+    )
+    rate_cmd.add_argument("--warmup", type=float, default=2.0, help="unmeasured seconds per run")
+    rate_cmd.add_argument("--duration", type=float, default=10.0, help="min measured s per run")
+    rate_cmd.add_argument(
+        "--min-samples",
+        type=int,
+        default=60,
+        help="stretch a run so even a slow rate gets this many requests (default 60)",
+    )
+    rate_cmd.add_argument("--repeat", type=int, default=3, help="runs per rate (default 3)")
+
     validate = sub.add_parser(
         "validate", help="validation suite (vardiff-on work audit: duplicate / overlapping work)"
     )
@@ -177,6 +217,7 @@ def _build_parser() -> argparse.ArgumentParser:
     suite.add_argument(
         "--out", default=results.DEFAULT_OUT_DIR, help="dir to store run data (default: results)"
     )
+    _add_lb_options(suite)
     suite.add_argument(
         "--cores",
         default="1 1-4",
@@ -235,12 +276,15 @@ def _cmd_list(registry: config.Registry) -> int:
     pinning = registry.pinning
     print()
     if pinning.enabled:
+        lb = f"  lb={pinning.lb_cpus}" if pinning.lb_cpus else ""
         print(
             f"cpu pinning: bitcoind={pinning.bitcoind_cpus}  pool={pinning.pool_cpus}  "
-            f"bench={pinning.bench_cpus}"
+            f"bench={pinning.bench_cpus}{lb}"
         )
     else:
         print("cpu pinning: disabled")
+    if registry.loadbalancer is not None:
+        print(f"load balancer (--via-lb): {registry.loadbalancer.description}")
     return 0
 
 
@@ -251,15 +295,29 @@ def _apply_pinning_overrides(
     bitcoind_cpus = getattr(args, "bitcoind_cpus", None)
     pool_cpus = getattr(args, "pool_cpus", None)
     bench_cpus = getattr(args, "bench_cpus", None)
+    lb_cpus = getattr(args, "lb_cpus", None)
     no_pin = getattr(args, "no_pin", False)
-    explicit = any((bitcoind_cpus, pool_cpus, bench_cpus))
+    explicit = any((bitcoind_cpus, pool_cpus, bench_cpus, lb_cpus))
     pinning = config.Pinning(
         enabled=(base.enabled or explicit) and not no_pin,
         bitcoind_cpus=bitcoind_cpus or base.bitcoind_cpus,
         pool_cpus=pool_cpus or base.pool_cpus,
         bench_cpus=bench_cpus or base.bench_cpus,
+        lb_cpus=lb_cpus or base.lb_cpus,
     )
     return registry if pinning == base else dataclasses.replace(registry, pinning=pinning)
+
+
+def _apply_via_lb(registry: config.Registry, args: argparse.Namespace) -> config.Registry:
+    """With --via-lb, route every pool through the registry's load balancer. The suite checks its
+    pinning per core config (it reassigns pool/bench cores); other commands check it here."""
+    if not getattr(args, "via_lb", False):
+        return registry
+    if registry.loadbalancer is None:
+        raise config.ConfigError("--via-lb needs a `loadbalancer:` section in the registry")
+    if args.command != "suite":
+        config.check_lb_pinning(registry.pinning)
+    return dataclasses.replace(registry, via_lb=True)
 
 
 def _standalone_backend(registry: config.Registry) -> regtest_module.Backend:
@@ -365,6 +423,25 @@ def _dispatch(args: argparse.Namespace, registry: config.Registry) -> int:
             label=args.label,
             keep=args.keep,
         )
+    if args.command == "rate":
+        rate_knobs = runner.RateKnobs(
+            connections=args.connections,
+            workers=args.workers,
+            warmup=args.warmup,
+            duration=args.duration,
+            min_samples=args.min_samples,
+            repeat=max(1, args.repeat),
+        )
+        return runner.rate(
+            registry,
+            pools,
+            args.profile,
+            _rate_list(args.rates),
+            rate_knobs,
+            out=args.out or None,
+            label=args.label,
+            keep=args.keep,
+        )
     if args.command == "validate":
         return runner.validate(
             registry,
@@ -412,6 +489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "report":
             return _cmd_report(args.out)
         registry = _apply_pinning_overrides(config.load_registry(args.registry), args)
+        registry = _apply_via_lb(registry, args)
         return _dispatch(args, registry)
     except config.ConfigError as exc:
         LOG.error("config error: %s", exc)

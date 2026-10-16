@@ -405,7 +405,53 @@ _HTML_TEMPLATE = r"""<!doctype html>
       host.appendChild(table(run));
     });
   }
-  function lineChart(host, byPool, pools) {
+  // rate: open-loop submit->ack latency vs offered request rate (log x), one line per pool; each
+  // point is the median of that rate's repeats, like the table.
+  var RATE_METRICS = [["p50", "p50"], ["p90", "p90"], ["p99", "p99"], ["p999", "p99.9"], ["max", "max"]];
+  function median(values) {
+    var sorted = values.slice().sort(function (a, b) { return a - b; }), middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+  function rateSection(rateRuns) {
+    if (!rateRuns.length) return;
+    var host = section("Latency at fixed request rates - rate");
+    rateRuns.forEach(function (run) {
+      var select = elem("select");
+      RATE_METRICS.forEach(function (metric) { select.appendChild(elem("option", { value: metric[0], text: metric[1] })); });
+      select.value = "p99";
+      host.appendChild(elem("div", { class: "row" }, [elem("label", { class: "ctl", text: "latency" }), select]));
+      var box = elem("div");
+      host.appendChild(box);
+      function draw() {
+        box.innerHTML = "";
+        var byPool = {}, name = select.options[select.selectedIndex].text;
+        (run.records || []).forEach(function (record) {
+          var rate = toNumber(record.rate);
+          var values = (record.runs || []).map(function (attempt) { return toNumber((attempt.latency_ms || {})[select.value]); })
+            .filter(function (value) { return value != null; });
+          if (record.pool == null || rate == null || !values.length) return;
+          (byPool[record.pool] = byPool[record.pool] || []).push([rate, median(values)]);
+        });
+        var pools = Object.keys(byPool);
+        pools.forEach(function (pool) { byPool[pool].sort(function (pointA, pointB) { return pointA[0] - pointB[0]; }); });
+        lineChart(box, byPool, pools, {
+          xLabel: "requests/s (log scale) - y: " + name + " ms from scheduled send",
+          logX: true,
+          xTicks: true,
+          tip: function (pool, x, y) { return pool + " @ " + formatNumber(x) + " req/s: " + name + " " + formatNumber(y) + " ms"; }
+        });
+      }
+      select.addEventListener("change", draw);
+      draw();
+      host.appendChild(elem("div", { class: "sub", style: "margin-top:6px", text: run.label + " | " + run.timestamp }));
+      host.appendChild(table(run));
+    });
+  }
+
+  // opts (all optional): xLabel, logX (log10 x axis), xTicks (label each data x), tip(pool, x, y).
+  function lineChart(host, byPool, pools, opts) {
+    opts = opts || {};
+    var tip = opts.tip || function (pool, x, y) { return pool + " @ " + x + " conns: " + formatNumber(y) + "/s"; };
     var series = pools.map(function (pool, index) {
       return { label: pool, color: COLORS[index % COLORS.length], on: true };
     });
@@ -416,35 +462,46 @@ _HTML_TEMPLATE = r"""<!doctype html>
       var active = series.filter(function (entry) { return entry.on; });
       var width = 900, height = 320, marginLeft = 60, marginRight = 12, marginTop = 12, marginBottom = 40;
       var innerWidth = width - marginLeft - marginRight, innerHeight = height - marginTop - marginBottom;
-      var maxX = 1, maxY = 1;
+      var maxX = 1, maxY = 1, minX = Infinity, xs = {};
       active.forEach(function (entry) {
         byPool[entry.label].forEach(function (point) {
           if (point[0] > maxX) maxX = point[0];
+          if (point[0] < minX) minX = point[0];
           if (point[1] > maxY) maxY = point[1];
+          xs[point[0]] = true;
         });
       });
+      if (!(minX < maxX)) minX = maxX / 10;  // a single x (or none): give the log axis a span
       var svg = elem("svg", { viewBox: "0 0 " + width + " " + height, role: "img" });
       for (var tick = 0; tick <= 4; tick++) {
         var gridY = marginTop + innerHeight - innerHeight * tick / 4;
         svg.appendChild(elem("line", { class: "grid", x1: marginLeft, y1: gridY, x2: width - marginRight, y2: gridY }));
         svg.appendChild(elem("text", { class: "lbl", x: marginLeft - 8, y: gridY + 4, "text-anchor": "end", text: formatNumber(maxY * tick / 4) }));
       }
-      function scaleX(value) { return marginLeft + innerWidth * value / maxX; }
+      function scaleX(value) {
+        if (opts.logX) return marginLeft + innerWidth * (Math.log10(value) - Math.log10(minX)) / (Math.log10(maxX) - Math.log10(minX));
+        return marginLeft + innerWidth * value / maxX;
+      }
       function scaleY(value) { return marginTop + innerHeight - innerHeight * value / maxY; }
+      if (opts.xTicks) {
+        Object.keys(xs).forEach(function (x) {
+          svg.appendChild(elem("text", { class: "lbl", x: scaleX(Number(x)), y: marginTop + innerHeight + 14, "text-anchor": "middle", text: formatNumber(Number(x)) }));
+        });
+      }
       active.forEach(function (entry) {
         var points = byPool[entry.label].map(function (point) { return scaleX(point[0]) + "," + scaleY(point[1]); }).join(" ");
         svg.appendChild(elem("polyline", { points: points, fill: "none", stroke: entry.color, "stroke-width": 2 }));
         byPool[entry.label].forEach(function (point) {
           var dot = elem("circle", { cx: scaleX(point[0]), cy: scaleY(point[1]), r: 3.5, fill: entry.color });
           dot.addEventListener("mousemove", function (event) {
-            showTooltip(event, entry.label + " @ " + point[0] + " conns: " + formatNumber(point[1]) + "/s");
+            showTooltip(event, tip(entry.label, point[0], point[1]));
           });
           dot.addEventListener("mouseleave", hideTooltip);
           svg.appendChild(dot);
         });
       });
       svg.appendChild(elem("line", { class: "axis", x1: marginLeft, y1: marginTop + innerHeight, x2: width - marginRight, y2: marginTop + innerHeight }));
-      svg.appendChild(elem("text", { class: "lbl", x: marginLeft + innerWidth / 2, y: height - 6, "text-anchor": "middle", text: "connections" }));
+      svg.appendChild(elem("text", { class: "lbl", x: marginLeft + innerWidth / 2, y: height - 6, "text-anchor": "middle", text: opts.xLabel || "connections" }));
       box.appendChild(svg);
     }
     draw();
@@ -464,6 +521,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
   benchSection(runsOfKind("bench"));
   sweepSection(runsOfKind("sweep"));
+  rateSection(runsOfKind("rate"));
   ["test", "latency", "connscale", "conn-limit", "validate"].forEach(function (kind) {
     var kindRuns = runsOfKind(kind);
     if (!kindRuns.length) return;

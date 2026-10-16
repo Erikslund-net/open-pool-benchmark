@@ -30,13 +30,18 @@ class Client:
         self.job_id = None
         self.notify_ts = 0.0
         self.new_job = asyncio.Event()
+        self.subscribed = asyncio.Event()
 
     async def connect(self, host, port, address):
         self._r, self._w = await asyncio.open_connection(host, port)
+        asyncio.create_task(self._read())
+        # authorize only after the subscribe reply: pipelined, ckpool can take the authorize first
+        # and reject it, and then never sends this client a job
         self._send({"id": 1, "method": "mining.subscribe", "params": ["zmqbench/1.0"]})
+        await self._w.drain()
+        await asyncio.wait_for(self.subscribed.wait(), 30)
         self._send({"id": 2, "method": "mining.authorize", "params": [address, "x"]})
         await self._w.drain()
-        asyncio.create_task(self._read())
 
     def _send(self, obj):
         self._w.write(frame(obj))
@@ -50,7 +55,9 @@ class Client:
                 message = DECODER.decode(line)
             except ValueError:
                 continue
-            if message.method == "mining.notify":
+            if message.id == 1:
+                self.subscribed.set()
+            elif message.method == "mining.notify":
                 job_id = message.params[0]
                 if job_id != self.job_id:
                     self.notify_ts = time.perf_counter()
